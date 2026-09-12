@@ -1,0 +1,96 @@
+name: Upstream abgleichen
+
+# Gleicht diesen Fork woechentlich mit dem Original ab und MELDET, wenn sich
+# etwas geaendert hat. Der Abgleich allein genuegt nicht: er laeuft still.
+#
+# Zwei dokumentierte Stillstandsrisiken, beide hier beantwortet:
+#   1. In einem Fork sind geplante Ablaeufe zunaechst abgeschaltet und muessen
+#      einmalig von Hand eingeschaltet werden.
+#   2. In einem oeffentlichen Repo schaltet GitHub geplante Ablaeufe ab, wenn
+#      60 Tage lang keine Aktivitaet stattfand. Deshalb schreibt jeder Lauf ein
+#      Lebenszeichen: das ist Aktivitaet UND Positivkontrolle in einem.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: upstream-abgleich
+  cancel-in-progress: false
+
+jobs:
+  abgleich:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fork auschecken
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Stand vor dem Abgleich festhalten
+        id: vorher
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Mit dem Original abgleichen
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh repo sync "${{ github.repository }}" --branch "${{ github.event.repository.default_branch }}" --force
+          git fetch origin "${{ github.event.repository.default_branch }}"
+          git reset --hard "origin/${{ github.event.repository.default_branch }}"
+
+      - name: Stand nach dem Abgleich festhalten
+        id: nachher
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          {
+            echo "anzahl=$(git rev-list --count ${{ steps.vorher.outputs.sha }}..HEAD)"
+            echo "liste<<ENDE"
+            git log --no-merges --pretty=format:'- %h %ad %s' --date=short \
+              "${{ steps.vorher.outputs.sha }}..HEAD" | head -40
+            echo ""
+            echo "ENDE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Lebenszeichen schreiben
+        run: |
+          {
+            echo "# Letzter Abgleich mit dem Original"
+            echo ""
+            echo "Zeitpunkt: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "Stand danach: $(git rev-parse HEAD)"
+            echo "Neue Commits in diesem Lauf: ${{ steps.nachher.outputs.anzahl }}"
+            echo ""
+            echo "Diese Datei ist die Positivkontrolle. Ist der Zeitpunkt aelter"
+            echo "als zwei Wochen, laeuft der geplante Abgleich nicht mehr."
+          } > LETZTER-ABGLEICH.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add LETZTER-ABGLEICH.md
+          git diff --staged --quiet || git commit -m "Lebenszeichen des Upstream-Abgleichs"
+          git push origin HEAD:"${{ github.event.repository.default_branch }}"
+
+      - name: Bei Aenderung melden
+        if: steps.nachher.outputs.anzahl != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "Original hat ${{ steps.nachher.outputs.anzahl }} neue Commits" \
+            --body "$(printf '%s\n' \
+              'Der woechentliche Abgleich hat Aenderungen aus dem Originalrepo uebernommen.' \
+              '' \
+              'Stand vorher: ${{ steps.vorher.outputs.sha }}' \
+              'Stand jetzt:  ${{ steps.nachher.outputs.sha }}' \
+              '' \
+              'Was sich geaendert hat:' \
+              '${{ steps.nachher.outputs.liste }}' \
+              '' \
+              'ACHTUNG: Die laufende Fassung wechselt dadurch NICHT. Der Eintrag in' \
+              'der MCP-Konfiguration traegt eine feste Version und bleibt, bis' \
+              'jemand sie bewusst anhebt.')"
